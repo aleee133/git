@@ -13,7 +13,7 @@
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see http://www.gnu.org/licenses/ .
+# along with this program.  If not, see https://www.gnu.org/licenses/ .
 
 # On Unix/Linux, the path separator is the colon, on other systems it
 # may be different, though. On Windows, for example, it is a semicolon.
@@ -44,17 +44,21 @@ else
 	# needing to exist.
 	TEST_DIRECTORY=$(cd "$TEST_DIRECTORY" && pwd) || exit 1
 fi
-if test -z "$TEST_OUTPUT_DIRECTORY"
-then
-	# Similarly, override this to store the test-results subdir
-	# elsewhere
-	TEST_OUTPUT_DIRECTORY=$TEST_DIRECTORY
-fi
-GIT_BUILD_DIR="${TEST_DIRECTORY%/t}"
+GIT_BUILD_DIR="${GIT_BUILD_DIR:-${TEST_DIRECTORY%/t}}"
 if test "$TEST_DIRECTORY" = "$GIT_BUILD_DIR"
 then
 	echo "PANIC: Running in a $TEST_DIRECTORY that doesn't end in '/t'?" >&2
 	exit 1
+fi
+if test -f "$GIT_BUILD_DIR/GIT-BUILD-DIR"
+then
+	GIT_BUILD_DIR="$(cat "$GIT_BUILD_DIR/GIT-BUILD-DIR")" || exit 1
+	# On Windows, we must convert Windows paths lest they contain a colon
+	case "$(uname -s)" in
+	*MINGW*)
+		GIT_BUILD_DIR="$(cygpath -au "$GIT_BUILD_DIR")"
+		;;
+	esac
 fi
 
 # Prepend a string to a VAR using an arbitrary ":" delimiter, not
@@ -85,8 +89,21 @@ prepend_var ASAN_OPTIONS : detect_leaks=0
 export ASAN_OPTIONS
 
 prepend_var LSAN_OPTIONS : $GIT_SAN_OPTIONS
+prepend_var LSAN_OPTIONS : exitcode=0
 prepend_var LSAN_OPTIONS : fast_unwind_on_malloc=0
 export LSAN_OPTIONS
+
+prepend_var UBSAN_OPTIONS : $GIT_SAN_OPTIONS
+export UBSAN_OPTIONS
+
+# The TEST_OUTPUT_DIRECTORY will be overwritten via GIT-BUILD-OPTIONS. So in
+# case the caller has manually set up this variable via the environment we must
+# make sure to not overwrite that value, and thus we save it into
+# TEST_OUTPUT_DIRECTORY_OVERRIDE here.
+if test -n "$TEST_OUTPUT_DIRECTORY" && test -z "$TEST_OUTPUT_DIRECTORY_OVERRIDE"
+then
+	TEST_OUTPUT_DIRECTORY_OVERRIDE=$TEST_OUTPUT_DIRECTORY
+fi
 
 if test ! -f "$GIT_BUILD_DIR"/GIT-BUILD-OPTIONS
 then
@@ -95,6 +112,13 @@ then
 fi
 . "$GIT_BUILD_DIR"/GIT-BUILD-OPTIONS
 export PERL_PATH SHELL_PATH
+
+if test -z "$TEST_OUTPUT_DIRECTORY"
+then
+	# Similarly, override this to store the test-results subdir
+	# elsewhere
+	TEST_OUTPUT_DIRECTORY=$TEST_DIRECTORY
+fi
 
 # In t0000, we need to override test directories of nested testcases. In case
 # the developer has TEST_OUTPUT_DIRECTORY part of his build options, then we'd
@@ -247,6 +271,9 @@ parse_option () {
 			;;
 		esac
 		;;
+	--invert-exit-code)
+		invert_exit_code=t
+		;;
 	*)
 		echo "error: unknown test option '$opt'" >&2; exit 1 ;;
 	esac
@@ -311,6 +338,10 @@ TEST_NUMBER="${TEST_NAME%%-*}"
 TEST_NUMBER="${TEST_NUMBER#t}"
 TEST_RESULTS_DIR="$TEST_OUTPUT_DIRECTORY/test-results"
 TEST_RESULTS_BASE="$TEST_RESULTS_DIR/$TEST_NAME$TEST_STRESS_JOB_SFX"
+TEST_RESULTS_SAN_FILE_PFX=trace
+TEST_RESULTS_SAN_DIR_SFX=leak
+TEST_RESULTS_SAN_FILE=
+TEST_RESULTS_SAN_DIR="$TEST_RESULTS_BASE.$TEST_RESULTS_SAN_DIR_SFX"
 TRASH_DIRECTORY="trash directory.$TEST_NAME$TEST_STRESS_JOB_SFX"
 test -n "$root" && TRASH_DIRECTORY="$root/$TRASH_DIRECTORY"
 case "$TRASH_DIRECTORY" in
@@ -488,6 +519,7 @@ unset VISUAL EMAIL LANGUAGE $(env | sed -n \
 	-e '/^GIT_PERF_/d' \
 	-e '/^GIT_CURL_VERBOSE/d' \
 	-e '/^GIT_TRACE_CURL/d' \
+	-e '/^GIT_BUILD_DIR/d' \
 	-e 's/^\(GIT_[^=]*\)=.*/\1/p')
 unset XDG_CACHE_HOME
 unset XDG_CONFIG_HOME
@@ -514,6 +546,8 @@ export EDITOR
 
 GIT_DEFAULT_HASH="${GIT_TEST_DEFAULT_HASH:-sha1}"
 export GIT_DEFAULT_HASH
+GIT_DEFAULT_REF_FORMAT="${GIT_TEST_DEFAULT_REF_FORMAT:-files}"
+export GIT_DEFAULT_REF_FORMAT
 GIT_TEST_MERGE_ALGORITHM="${GIT_TEST_MERGE_ALGORITHM:-ort}"
 export GIT_TEST_MERGE_ALGORITHM
 
@@ -548,51 +582,6 @@ case $GIT_TEST_FSYNC in
 	;;
 esac
 
-# Add libc MALLOC and MALLOC_PERTURB test only if we are not executing
-# the test with valgrind and have not compiled with SANITIZE=address.
-if test -n "$valgrind" ||
-   test -n "$SANITIZE_ADDRESS" ||
-   test -n "$TEST_NO_MALLOC_CHECK"
-then
-	setup_malloc_check () {
-		: nothing
-	}
-	teardown_malloc_check () {
-		: nothing
-	}
-else
-	_USE_GLIBC_TUNABLES=
-	if _GLIBC_VERSION=$(getconf GNU_LIBC_VERSION 2>/dev/null) &&
-	   _GLIBC_VERSION=${_GLIBC_VERSION#"glibc "} &&
-	   expr 2.34 \<= "$_GLIBC_VERSION" >/dev/null
-	then
-		_USE_GLIBC_TUNABLES=YesPlease
-	fi
-	setup_malloc_check () {
-		local g
-		local t
-		MALLOC_CHECK_=3	MALLOC_PERTURB_=165
-		export MALLOC_CHECK_ MALLOC_PERTURB_
-		if test -n "$_USE_GLIBC_TUNABLES"
-		then
-			g=
-			LD_PRELOAD="libc_malloc_debug.so.0"
-			for t in \
-				glibc.malloc.check=1 \
-				glibc.malloc.perturb=165
-			do
-				g="${g#:}:$t"
-			done
-			GLIBC_TUNABLES=$g
-			export LD_PRELOAD GLIBC_TUNABLES
-		fi
-	}
-	teardown_malloc_check () {
-		unset MALLOC_CHECK_ MALLOC_PERTURB_
-		unset LD_PRELOAD GLIBC_TUNABLES
-	}
-fi
-
 # Protect ourselves from common misconfiguration to export
 # CDPATH into the environment
 unset CDPATH
@@ -619,12 +608,6 @@ u200c=$(printf '\342\200\214')
 
 export _x05 _x35 LF u200c EMPTY_TREE EMPTY_BLOB ZERO_OID OID_REGEX
 
-# Each test should start with something like this, after copyright notices:
-#
-# test_description='Description of this test...
-# This test checks if command xyzzy does the right thing...
-# '
-# . ./test-lib.sh
 test "x$TERM" != "xdumb" && (
 		test -t 1 &&
 		tput bold >/dev/null 2>&1 &&
@@ -797,15 +780,32 @@ test_ok_ () {
 	finalize_test_case_output ok "$@"
 }
 
+_invert_exit_code_failure_end_blurb () {
+	say_color warn "# faked up failures as TODO & now exiting with 0 due to --invert-exit-code"
+}
+
 test_failure_ () {
 	failure_label=$1
 	test_failure=$(($test_failure + 1))
-	say_color error "not ok $test_count - $1"
+	local pfx=""
+	if test -n "$invert_exit_code" # && test -n "$HARNESS_ACTIVE"
+	then
+		pfx="# TODO induced breakage (--invert-exit-code):"
+	fi
+	say_color error "not ok $test_count - ${pfx:+$pfx }$1"
 	shift
 	printf '%s\n' "$*" | sed -e 's/^/#	/'
 	if test -n "$immediate"
 	then
 		say_color error "1..$test_count"
+		if test -n "$invert_exit_code"
+		then
+			finalize_test_output
+			_invert_exit_code_failure_end_blurb
+			GIT_EXIT_OK=t
+			exit 0
+		fi
+		check_test_results_san_file_ "$test_failure"
 		_error_exit
 	fi
 	finalize_test_case_output failure "$failure_label" "$@"
@@ -813,14 +813,14 @@ test_failure_ () {
 
 test_known_broken_ok_ () {
 	test_fixed=$(($test_fixed+1))
-	say_color error "ok $test_count - $@ # TODO known breakage vanished"
-	finalize_test_case_output fixed "$@"
+	say_color error "ok $test_count - $1 # TODO known breakage vanished"
+	finalize_test_case_output fixed "$1"
 }
 
 test_known_broken_failure_ () {
 	test_broken=$(($test_broken+1))
-	say_color warn "not ok $test_count - $@ # TODO known breakage"
-	finalize_test_case_output broken "$@"
+	say_color warn "not ok $test_count - $1 # TODO known breakage"
+	finalize_test_case_output broken "$1"
 }
 
 test_debug () {
@@ -1005,10 +1005,7 @@ want_trace () {
 # (and we want to make sure we run any cleanup like
 # "set +x").
 test_eval_inner_ () {
-	# Do not add anything extra (including LF) after '$*'
-	eval "
-		want_trace && trace_level_=$(($trace_level_+1)) && set -x
-		$*"
+	eval "$*"
 }
 
 test_eval_ () {
@@ -1033,7 +1030,10 @@ test_eval_ () {
 	#     be _inside_ the block to avoid polluting the "set -x" output
 	#
 
-	test_eval_inner_ "$@" </dev/null >&3 2>&4
+	# Do not add anything extra (including LF) after '$*'
+	test_eval_inner_ </dev/null >&3 2>&4 "
+		want_trace && trace_level_=$(($trace_level_+1)) && set -x
+		$*"
 	{
 		test_eval_ret_=$?
 		if want_trace
@@ -1050,26 +1050,22 @@ test_eval_ () {
 	return $test_eval_ret_
 }
 
+fail_117 () {
+	return 117
+}
+
 test_run_ () {
 	test_cleanup=:
 	expecting_failure=$2
 
 	if test "${GIT_TEST_CHAIN_LINT:-1}" != 0; then
-		# turn off tracing for this test-eval, as it simply creates
-		# confusing noise in the "-x" output
-		trace_tmp=$trace
-		trace=
 		# 117 is magic because it is unlikely to match the exit
 		# code of other programs
-		if test "OK-117" != "$(test_eval_ "(exit 117) && $1${LF}${LF}echo OK-\$?" 3>&1)" ||
-		   {
-			test "${GIT_TEST_CHAIN_LINT_HARDER:-${GIT_TEST_CHAIN_LINT_HARDER_DEFAULT:-1}}" != 0 &&
-			$(printf '%s\n' "$1" | sed -f "$GIT_BUILD_DIR/t/chainlint.sed" | grep -q '?![A-Z][A-Z]*?!')
-		   }
+		test_eval_inner_ "fail_117 && $1" </dev/null >&3 2>&4
+		if test $? != 117
 		then
-			BUG "broken &&-chain or run-away HERE-DOC: $1"
+			BUG "broken &&-chain: $1"
 		fi
-		trace=$trace_tmp
 	fi
 
 	setup_malloc_check
@@ -1177,9 +1173,35 @@ test_atexit_handler () {
 	teardown_malloc_check
 }
 
-test_done () {
-	GIT_EXIT_OK=t
+check_test_results_san_file_has_entries_ () {
+	test -z "$TEST_RESULTS_SAN_FILE" && return 1
 
+	# Lines marked with DEDUP_TOKEN show unique leaks. We only care that we
+	# found at least one.
+	#
+	# But also suppress any false positives caused by bugs or races in the
+	# sanitizer itself.
+	grep -s ^DEDUP_TOKEN "$TEST_RESULTS_SAN_FILE".* |
+	grep -qv sanitizer::GetThreadStackTopAndBottom
+}
+
+check_test_results_san_file_ () {
+	if ! check_test_results_san_file_has_entries_
+	then
+		return
+	fi &&
+	say_color error "$(cat "$TEST_RESULTS_SAN_FILE".*)" &&
+
+	if test "$test_failure" = 0
+	then
+		say "Our logs revealed a memory leak, exit non-zero!" &&
+		invert_exit_code=t
+	else
+		say "Our logs revealed a memory leak..."
+	fi
+}
+
+test_done () {
 	# Run the atexit commands _before_ the trash directory is
 	# removed, so the commands can access pidfiles and socket files.
 	test_atexit_handler
@@ -1219,28 +1241,32 @@ test_done () {
 	fi
 	case "$test_failure" in
 	0)
-		if test $test_external_has_tap -eq 0
+		if test $test_remaining -gt 0
 		then
-			if test $test_remaining -gt 0
-			then
-				say_color pass "# passed all $msg"
-			fi
-
-			# Maybe print SKIP message
-			test -z "$skip_all" || skip_all="# SKIP $skip_all"
-			case "$test_count" in
-			0)
-				say "1..$test_count${skip_all:+ $skip_all}"
-				;;
-			*)
-				test -z "$skip_all" ||
-				say_color warn "$skip_all"
-				say "1..$test_count"
-				;;
-			esac
+			say_color pass "# passed all $msg"
 		fi
 
-		if test -z "$debug" && test -n "$remove_trash"
+		# Maybe print SKIP message
+		test -z "$skip_all" || skip_all="# SKIP $skip_all"
+		case "$test_count" in
+		0)
+			say "1..$test_count${skip_all:+ $skip_all}"
+			;;
+		*)
+			test -z "$skip_all" ||
+			say_color warn "$skip_all"
+			say "1..$test_count"
+			;;
+		esac
+
+		if test -n "$stress" && test -n "$invert_exit_code"
+		then
+			# We're about to move our "$TRASH_DIRECTORY"
+			# to "$TRASH_DIRECTORY.stress-failed" if
+			# --stress is combined with
+			# --invert-exit-code.
+			say "with --stress and --invert-exit-code we're not removing '$TRASH_DIRECTORY'"
+		elif test -z "$debug" && test -n "$remove_trash"
 		then
 			test -d "$TRASH_DIRECTORY" ||
 			error "Tests passed but trash directory already removed before test cleanup; aborting"
@@ -1253,17 +1279,35 @@ test_done () {
 			} ||
 			error "Tests passed but test cleanup failed; aborting"
 		fi
+
+		check_test_results_san_file_ "$test_failure"
+
+		if test -z "$skip_all" && test -n "$invert_exit_code"
+		then
+			say_color warn "# faking up non-zero exit with --invert-exit-code"
+			GIT_EXIT_OK=t
+			exit 1
+		fi
+
 		test_at_end_hook_
 
+		GIT_EXIT_OK=t
 		exit 0 ;;
 
 	*)
-		if test $test_external_has_tap -eq 0
+		say_color error "# failed $test_failure among $msg"
+		say "1..$test_count"
+
+		check_test_results_san_file_ "$test_failure"
+
+		if test -n "$invert_exit_code"
 		then
-			say_color error "# failed $test_failure among $msg"
-			say "1..$test_count"
+			_invert_exit_code_failure_end_blurb
+			GIT_EXIT_OK=t
+			exit 0
 		fi
 
+		GIT_EXIT_OK=t
 		exit 1 ;;
 
 	esac
@@ -1377,11 +1421,61 @@ else # normal case, use ../bin-wrappers only unless $with_dashes:
 		PATH="$GIT_BUILD_DIR$PATH_SEP$GIT_BUILD_DIR/t/helper$PATH_SEP$PATH"
 	fi
 fi
-GIT_TEMPLATE_DIR="$GIT_BUILD_DIR"/templates/blt
+GIT_TEMPLATE_DIR="$GIT_TEST_TEMPLATE_DIR"
 GIT_CONFIG_NOSYSTEM=1
 GIT_ATTR_NOSYSTEM=1
 GIT_CEILING_DIRECTORIES="$TRASH_DIRECTORY/.."
 export PATH GIT_EXEC_PATH GIT_TEMPLATE_DIR GIT_CONFIG_NOSYSTEM GIT_ATTR_NOSYSTEM GIT_CEILING_DIRECTORIES
+
+# Add libc MALLOC and MALLOC_PERTURB test only if we are not executing
+# the test with valgrind and have not compiled with conflict SANITIZE
+# options.
+if test -n "$valgrind" ||
+   test -n "$SANITIZE_ADDRESS" ||
+   test -n "$SANITIZE_LEAK" ||
+   test -n "$TEST_NO_MALLOC_CHECK"
+then
+	setup_malloc_check () {
+		: nothing
+	}
+	teardown_malloc_check () {
+		: nothing
+	}
+else
+	_USE_GLIBC_TUNABLES=
+	_USE_GLIBC_PRELOAD=libc_malloc_debug.so.0
+	if _GLIBC_VERSION=$(getconf GNU_LIBC_VERSION 2>/dev/null) &&
+	   _GLIBC_VERSION=${_GLIBC_VERSION#"glibc "} &&
+	   expr 2.34 \<= "$_GLIBC_VERSION" >/dev/null &&
+	   stderr=$(LD_PRELOAD=$_USE_GLIBC_PRELOAD git version 2>&1 >/dev/null) &&
+	   test -z "$stderr"
+	then
+		_USE_GLIBC_TUNABLES=YesPlease
+	fi
+	setup_malloc_check () {
+		local g
+		local t
+		MALLOC_CHECK_=3	MALLOC_PERTURB_=165
+		export MALLOC_CHECK_ MALLOC_PERTURB_
+		if test -n "$_USE_GLIBC_TUNABLES"
+		then
+			g=
+			LD_PRELOAD=$_USE_GLIBC_PRELOAD
+			for t in \
+				glibc.malloc.check=1 \
+				glibc.malloc.perturb=165
+			do
+				g="${g#:}:$t"
+			done
+			GLIBC_TUNABLES=$g
+			export LD_PRELOAD GLIBC_TUNABLES
+		fi
+	}
+	teardown_malloc_check () {
+		unset MALLOC_CHECK_ MALLOC_PERTURB_
+		unset LD_PRELOAD GLIBC_TUNABLES
+	}
+fi
 
 if test -z "$GIT_TEST_CMP"
 then
@@ -1393,17 +1487,15 @@ then
 	fi
 fi
 
-GITPERLLIB="$GIT_BUILD_DIR"/perl/build/lib
+GITPERLLIB="$GIT_TEST_GITPERLLIB"
 export GITPERLLIB
-test -d "$GIT_BUILD_DIR"/templates/blt || {
-	error "You haven't built things yet, have you?"
+test -d "$GIT_TEMPLATE_DIR" || {
+	BAIL_OUT "You haven't built things yet, have you?"
 }
 
 if ! test -x "$GIT_BUILD_DIR"/t/helper/test-tool$X
 then
-	echo >&2 'You need to build test-tool:'
-	echo >&2 'Run "make t/helper/test-tool" in the source (toplevel) directory'
-	exit 1
+	BAIL_OUT 'You need to build test-tool; Run "make t/helper/test-tool" in the source (toplevel) directory'
 fi
 
 # Are we running this test at all?
@@ -1417,24 +1509,29 @@ then
 	test_done
 fi
 
-# skip non-whitelisted tests when compiled with SANITIZE=leak
 if test -n "$SANITIZE_LEAK"
 then
-	if test_bool_env GIT_TEST_PASSING_SANITIZE_LEAK false
+	rm -rf "$TEST_RESULTS_SAN_DIR"
+	if ! mkdir -p "$TEST_RESULTS_SAN_DIR"
 	then
-		# We need to see it in "git env--helper" (via
-		# test_bool_env)
-		export TEST_PASSES_SANITIZE_LEAK
+		BAIL_OUT "cannot create $TEST_RESULTS_SAN_DIR"
+	fi &&
+	TEST_RESULTS_SAN_FILE="$TEST_RESULTS_SAN_DIR/$TEST_RESULTS_SAN_FILE_PFX"
 
-		if ! test_bool_env TEST_PASSES_SANITIZE_LEAK false
-		then
-			skip_all="skipping $this_test under GIT_TEST_PASSING_SANITIZE_LEAK=true"
-			test_done
-		fi
-	fi
-elif test_bool_env GIT_TEST_PASSING_SANITIZE_LEAK false
+	# Don't litter *.leak dirs if there was nothing to report
+	test_atexit "rmdir \"$TEST_RESULTS_SAN_DIR\" 2>/dev/null || :"
+
+	prepend_var LSAN_OPTIONS : dedup_token_length=9999
+	prepend_var LSAN_OPTIONS : log_exe_name=1
+	prepend_var LSAN_OPTIONS : log_path="'$TEST_RESULTS_SAN_FILE'"
+	export LSAN_OPTIONS
+fi
+
+if test "${GIT_TEST_CHAIN_LINT:-1}" != 0 &&
+   test "${GIT_TEST_EXT_CHAIN_LINT:-1}" != 0
 then
-	BAIL_OUT "GIT_TEST_PASSING_SANITIZE_LEAK=true has no effect except when compiled with SANITIZE=leak"
+	"$PERL_PATH" "$TEST_DIRECTORY/chainlint.pl" "$0" ||
+		BUG "lint error (see 'LINT' annotations above)"
 fi
 
 # Last-minute variable setup
@@ -1457,15 +1554,15 @@ remove_trash_directory () {
 
 # Test repository
 remove_trash_directory "$TRASH_DIRECTORY" || {
-	GIT_EXIT_OK=t
-	echo >&5 "FATAL: Cannot prepare test area"
-	exit 1
+	BAIL_OUT 'cannot prepare test area'
 }
 
 remove_trash=t
 if test -z "$TEST_NO_CREATE_REPO"
 then
-	git init "$TRASH_DIRECTORY" >&3 2>&4 ||
+	git init \
+	    ${TEST_CREATE_REPO_NO_TEMPLATE:+--template=} \
+	    "$TRASH_DIRECTORY" >&3 2>&4 ||
 	error "cannot run git init"
 else
 	mkdir -p "$TRASH_DIRECTORY"
@@ -1473,7 +1570,7 @@ fi
 
 # Use -P to resolve symlinks in our working directory so that the cwd
 # in subprocesses like git equals our $PWD (for pathname comparisons).
-cd -P "$TRASH_DIRECTORY" || exit 1
+cd -P "$TRASH_DIRECTORY" || BAIL_OUT "cannot cd -P to \"$TRASH_DIRECTORY\""
 
 start_test_output "$0"
 
@@ -1514,7 +1611,7 @@ yes () {
 # The GIT_TEST_FAIL_PREREQS code hooks into test_set_prereq(), and
 # thus needs to be set up really early, and set an internal variable
 # for convenience so the hot test_set_prereq() codepath doesn't need
-# to call "git env--helper" (via test_bool_env). Only do that work
+# to call "test-tool env-helper" (via test_bool_env). Only do that work
 # if needed by seeing if GIT_TEST_FAIL_PREREQS is set at all.
 GIT_TEST_FAIL_PREREQS_INTERNAL=
 if test -n "$GIT_TEST_FAIL_PREREQS"
@@ -1566,7 +1663,7 @@ case $uname_s in
 	test_set_prereq SED_STRIPS_CR
 	test_set_prereq GREP_STRIPS_CR
 	test_set_prereq WINDOWS
-	GIT_TEST_CMP="test-tool cmp"
+	GIT_TEST_CMP="GIT_DIR=/dev/null git diff --no-index --ignore-cr-at-eol --"
 	if ! type iconv >/dev/null 2>&1
 	then
 		iconv () {
@@ -1597,10 +1694,21 @@ parisc* | hppa*)
 	;;
 esac
 
-test_set_prereq REFFILES
+case "$GIT_DEFAULT_REF_FORMAT" in
+files)
+	test_set_prereq REFFILES;;
+reftable)
+	test_set_prereq REFTABLE;;
+*)
+	echo 2>&1 "error: unknown ref format $GIT_DEFAULT_REF_FORMAT"
+	exit 1
+	;;
+esac
 
 ( COLUMNS=1 && test $COLUMNS = 1 ) && test_set_prereq COLUMNS_CAN_BE_1
 test -z "$NO_CURL" && test_set_prereq LIBCURL
+test -z "$NO_GITWEB" && test_set_prereq GITWEB
+test -z "$NO_ICONV" && test_set_prereq ICONV
 test -z "$NO_PERL" && test_set_prereq PERL
 test -z "$NO_PTHREADS" && test_set_prereq PTHREADS
 test -z "$NO_PYTHON" && test_set_prereq PYTHON
@@ -1792,8 +1900,8 @@ test_lazy_prereq SHA1 '
 	esac
 '
 
-test_lazy_prereq ADD_I_USE_BUILTIN '
-	test_bool_env GIT_TEST_ADD_I_USE_BUILTIN true
+test_lazy_prereq DEFAULT_REPO_FORMAT '
+	test_have_prereq SHA1,REFFILES
 '
 
 # Ensure that no test accidentally triggers a Git command
@@ -1802,6 +1910,7 @@ test_lazy_prereq ADD_I_USE_BUILTIN '
 # Tests that verify the scheduler integration must set this locally
 # to avoid errors.
 GIT_TEST_MAINT_SCHEDULER="none:exit 1"
+export GIT_TEST_MAINT_SCHEDULER
 
 # Does this platform support `git fsmonitor--daemon`
 #

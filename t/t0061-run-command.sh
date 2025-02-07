@@ -5,7 +5,6 @@
 
 test_description='Test run command'
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 cat >hello-script <<-EOF
@@ -19,12 +18,12 @@ test_expect_success MINGW 'subprocess inherits only std handles' '
 
 test_expect_success 'start_command reports ENOENT (slash)' '
 	test-tool run-command start-command-ENOENT ./does-not-exist 2>err &&
-	test_i18ngrep "\./does-not-exist" err
+	test_grep "\./does-not-exist" err
 '
 
 test_expect_success 'start_command reports ENOENT (no slash)' '
 	test-tool run-command start-command-ENOENT does-not-exist 2>err &&
-	test_i18ngrep "does-not-exist" err
+	test_grep "does-not-exist" err
 '
 
 test_expect_success 'run_command can run a command' '
@@ -49,7 +48,7 @@ test_expect_success !RUNS_COMMANDS_FROM_PWD 'run_command is restricted to PATH' 
 	echo yikes
 	EOF
 	test_must_fail test-tool run-command run-command should-not-run 2>err &&
-	test_i18ngrep "should-not-run" err
+	test_grep "should-not-run" err
 '
 
 test_expect_success !MINGW 'run_command can run a script without a #! line' '
@@ -130,7 +129,8 @@ World
 EOF
 
 test_expect_success 'run_command runs in parallel with more jobs available than tasks' '
-	test-tool run-command run-command-parallel 5 sh -c "printf \"%s\n%s\n\" Hello World" 2>actual &&
+	test-tool run-command run-command-parallel 5 sh -c "printf \"%s\n%s\n\" Hello World" >out 2>actual &&
+	test_must_be_empty out &&
 	test_cmp expect actual
 '
 
@@ -141,7 +141,8 @@ test_expect_success 'run_command runs ungrouped in parallel with more jobs avail
 '
 
 test_expect_success 'run_command runs in parallel with as many jobs as tasks' '
-	test-tool run-command run-command-parallel 4 sh -c "printf \"%s\n%s\n\" Hello World" 2>actual &&
+	test-tool run-command run-command-parallel 4 sh -c "printf \"%s\n%s\n\" Hello World" >out 2>actual &&
+	test_must_be_empty out &&
 	test_cmp expect actual
 '
 
@@ -152,7 +153,8 @@ test_expect_success 'run_command runs ungrouped in parallel with as many jobs as
 '
 
 test_expect_success 'run_command runs in parallel with more tasks than jobs available' '
-	test-tool run-command run-command-parallel 3 sh -c "printf \"%s\n%s\n\" Hello World" 2>actual &&
+	test-tool run-command run-command-parallel 3 sh -c "printf \"%s\n%s\n\" Hello World" >out 2>actual &&
+	test_must_be_empty out &&
 	test_cmp expect actual
 '
 
@@ -172,7 +174,8 @@ asking for a quick stop
 EOF
 
 test_expect_success 'run_command is asked to abort gracefully' '
-	test-tool run-command run-command-abort 3 false 2>actual &&
+	test-tool run-command run-command-abort 3 false >out 2>actual &&
+	test_must_be_empty out &&
 	test_cmp expect actual
 '
 
@@ -187,7 +190,8 @@ no further jobs available
 EOF
 
 test_expect_success 'run_command outputs ' '
-	test-tool run-command run-command-no-jobs 3 sh -c "printf \"%s\n%s\n\" Hello World" 2>actual &&
+	test-tool run-command run-command-no-jobs 3 sh -c "printf \"%s\n%s\n\" Hello World" >out 2>actual &&
+	test_must_be_empty out &&
 	test_cmp expect actual
 '
 

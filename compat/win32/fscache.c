@@ -1,11 +1,14 @@
-#include "../../cache.h"
+#include "../../git-compat-util.h"
 #include "../../hashmap.h"
 #include "../win32.h"
 #include "fscache.h"
 #include "../../dir.h"
+#include "../../abspath.h"
+#include "../../trace.h"
 #include "config.h"
 #include "../../mem-pool.h"
 #include "ntifs.h"
+#include "wsl.h"
 
 static volatile long initialized;
 static DWORD dwTlsIndex;
@@ -85,9 +88,9 @@ struct heap_fsentry {
 /*
  * Compares the paths of two fsentry structures for equality.
  */
-static int fsentry_cmp(void *unused_cmp_data,
+static int fsentry_cmp(void *cmp_data UNUSED,
 		       const struct fsentry *fse1, const struct fsentry *fse2,
-		       void *unused_keydata)
+		       void *keydata UNUSED)
 {
 	int res;
 	if (fse1 == fse2)
@@ -210,7 +213,7 @@ static struct fsentry *fseentry_create_entry(struct fscache *cache,
 	 * telling Git that these are *not* symbolic links.
 	 */
 	if (fse->reparse_tag == IO_REPARSE_TAG_SYMLINK &&
-	    sizeof(buf) > (list ? list->len + 1 : 0) + fse->len + 1 &&
+	    sizeof(buf) > (size_t)(list ? list->len + 1 : 0) + fse->len + 1 &&
 	    is_inside_windows_container()) {
 		size_t off = 0;
 		if (list) {
@@ -235,6 +238,21 @@ static struct fsentry *fseentry_create_entry(struct fscache *cache,
 			     &(fse->u.s.st_mtim));
 	filetime_to_timespec((FILETIME *)&(fdata->CreationTime),
 			     &(fse->u.s.st_ctim));
+	if (fdata->EaSize > 0 &&
+	    sizeof(buf) >= (size_t)(list ? list->len+1 : 0) + fse->len+1 &&
+	    are_wsl_compatible_mode_bits_enabled()) {
+		size_t off = 0;
+		wchar_t wpath[MAX_LONG_PATH];
+		if (list && list->len) {
+			memcpy(buf, list->dirent.d_name, list->len);
+			buf[list->len] = '/';
+			off = list->len + 1;
+		}
+		memcpy(buf + off, fse->dirent.d_name, fse->len);
+		buf[off + fse->len] = '\0';
+		if (xutftowcs_long_path(wpath, buf) >= 0)
+			copy_wsl_mode_bits_from_disk(wpath, -1, &fse->st_mode);
+	}
 
 	return fse;
 }
@@ -261,13 +279,13 @@ static struct fsentry *fsentry_create_list(struct fscache *cache, const struct f
 	/* convert name to UTF-16 and check length */
 	if ((wlen = xutftowcs_path_ex(pattern, dir->dirent.d_name,
 				      MAX_LONG_PATH, dir->len, MAX_PATH - 2,
-				      core_long_paths)) < 0)
+				      are_long_paths_enabled())) < 0)
 		return NULL;
 
 	/* handle CWD */
 	if (!wlen) {
 		wlen = GetCurrentDirectoryW(ARRAY_SIZE(pattern), pattern);
-		if (!wlen || wlen >= ARRAY_SIZE(pattern)) {
+		if (!wlen || wlen >= (ssize_t)ARRAY_SIZE(pattern)) {
 			errno = wlen ? ENAMETOOLONG : err_win_to_posix(GetLastError());
 			return NULL;
 		}
@@ -301,7 +319,7 @@ static struct fsentry *fsentry_create_list(struct fscache *cache, const struct f
 		 * instead of a directory).  Verify that is the actual cause
 		 * of the error.
 		*/
-		if (status == STATUS_INVALID_PARAMETER) {
+		if (status == (NTSTATUS)STATUS_INVALID_PARAMETER) {
 			DWORD attributes = GetFileAttributesW(pattern);
 			if (!(attributes & FILE_ATTRIBUTE_DIRECTORY))
 				status = ERROR_DIRECTORY;

@@ -8,7 +8,6 @@ test_description='git ls-files --others --exclude
 This test runs git ls-files --others and tests --exclude patterns.
 '
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 rm -fr one three
@@ -103,7 +102,7 @@ test_expect_success 'git ls-files --others with various exclude options.' '
 	test_cmp expect output
 '
 
-test_expect_success !SANITIZE_LEAK 'restore gitignore' '
+test_expect_success 'restore gitignore' '
 	git checkout --ignore-skip-worktree-bits $allignores &&
 	rm .git/index
 '
@@ -126,7 +125,7 @@ cat > expect << EOF
 #	three/
 EOF
 
-test_expect_success !SANITIZE_LEAK 'git status honors core.excludesfile' \
+test_expect_success 'git status honors core.excludesfile' \
 	'test_cmp expect output'
 
 test_expect_success 'trailing slash in exclude allows directory match(1)' '

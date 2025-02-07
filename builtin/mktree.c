@@ -3,12 +3,15 @@
  *
  * Copyright (c) Junio C Hamano, 2006, 2009
  */
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "gettext.h"
+#include "hex.h"
 #include "quote.h"
+#include "strbuf.h"
 #include "tree.h"
 #include "parse-options.h"
-#include "object-store.h"
-#include "config.h"
+#include "object-store-ll.h"
 
 static struct treeent {
 	unsigned mode;
@@ -148,7 +151,10 @@ static void mktree_line(char *buf, int nul_term_line, int allow_missing)
 	free(to_free);
 }
 
-int cmd_mktree(int ac, const char **av, const char *prefix)
+int cmd_mktree(int ac,
+	       const char **av,
+	       const char *prefix,
+	       struct repository *repo UNUSED)
 {
 	struct strbuf sb = STRBUF_INIT;
 	struct object_id oid;
@@ -165,7 +171,6 @@ int cmd_mktree(int ac, const char **av, const char *prefix)
 		OPT_END()
 	};
 
-	git_config(git_default_config, NULL);
 	ac = parse_options(ac, av, prefix, option, mktree_usage, 0);
 	getline_fn = nul_term_line ? strbuf_getline_nul : strbuf_getline_lf;
 
@@ -198,5 +203,6 @@ int cmd_mktree(int ac, const char **av, const char *prefix)
 		used=0; /* reset tree entry buffer for re-use in batch mode */
 	}
 	strbuf_release(&sb);
+
 	return 0;
 }

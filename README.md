@@ -1,6 +1,7 @@
 Git for Windows
 ===============
 
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 [![Open in Visual Studio Code](https://img.shields.io/static/v1?logo=visualstudiocode&label=&message=Open%20in%20Visual%20Studio%20Code&labelColor=2c2c32&color=007acc&logoColor=007acc)](https://open.vscode.dev/git-for-windows/git)
 [![Build status](https://github.com/git-for-windows/git/workflows/CI/badge.svg)](https://github.com/git-for-windows/git/actions?query=branch%3Amain+event%3Apush)
 [![Join the chat at https://gitter.im/git-for-windows/git](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/git-for-windows/git?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
@@ -111,10 +112,10 @@ Those wishing to help with error message, usage and informational message
 string translations (localization l10) should see [po/README.md][]
 (a `po` file is a Portable Object file that holds the translations).
 
-To subscribe to the list, send an email with just "subscribe git" in
-the body to majordomo@vger.kernel.org (not the Git list). The mailing
+To subscribe to the list, send an email to <git+subscribe@vger.kernel.org>
+(see https://subspace.kernel.org/subscribing.html for details). The mailing
 list archives are available at <https://lore.kernel.org/git/>,
-<http://marc.info/?l=git> and other archival sites.
+<https://marc.info/?l=git> and other archival sites.
 The core git mailing list is plain text (no HTML!).
 
 Issues which are security relevant should be disclosed privately to
