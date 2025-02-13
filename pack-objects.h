@@ -1,13 +1,14 @@
 #ifndef PACK_OBJECTS_H
 #define PACK_OBJECTS_H
 
-#include "object-store.h"
+#include "object-store-ll.h"
 #include "thread-utils.h"
 #include "pack.h"
 
 struct repository;
 
-#define DEFAULT_DELTA_CACHE_SIZE (256 * 1024 * 1024)
+#define DEFAULT_DELTA_CACHE_SIZE       (256 * 1024 * 1024)
+#define DEFAULT_DELTA_BASE_CACHE_LIMIT (96 * 1024 * 1024)
 
 #define OE_DFS_STATE_BITS	2
 #define OE_DEPTH_BITS		12
@@ -118,10 +119,22 @@ struct object_entry {
 	unsigned ext_base:1; /* delta_idx points outside packlist */
 };
 
+/**
+ * A packing region is a section of the packing_data.objects array
+ * as given by a starting index and a number of elements.
+ */
+struct packing_region {
+	uint32_t start;
+	uint32_t nr;
+};
+
 struct packing_data {
 	struct repository *repo;
 	struct object_entry *objects;
 	uint32_t nr_objects, nr_alloc;
+
+	struct packing_region *regions;
+	uint32_t nr_regions, nr_regions_alloc;
 
 	int32_t *index;
 	uint32_t index_size;
@@ -169,6 +182,7 @@ struct packing_data {
 };
 
 void prepare_packing_data(struct repository *r, struct packing_data *pdata);
+void clear_packing_data(struct packing_data *pdata);
 
 /* Protect access to object database */
 static inline void packing_data_lock(struct packing_data *pdata)
@@ -202,6 +216,27 @@ static inline uint32_t pack_name_hash(const char *name)
 		if (isspace(c))
 			continue;
 		hash = (hash >> 2) + (c << 24);
+	}
+	return hash;
+}
+
+static inline uint32_t pack_full_name_hash(const char *name)
+{
+	const uint32_t bigp = 1234572167U;
+	uint32_t c, hash = bigp;
+
+	if (!name)
+		return 0;
+
+	/*
+	 * Do the simplest thing that will resemble pseudo-randomness: add
+	 * random multiples of a large prime number with a binary shift.
+	 * The goal is not to be cryptographic, but to be generally
+	 * uniformly distributed.
+	 */
+	while ((c = *name++) != 0) {
+		hash += c * bigp;
+		hash = (hash >> 5) | (hash << 27);
 	}
 	return hash;
 }

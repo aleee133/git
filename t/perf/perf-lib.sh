@@ -15,7 +15,7 @@
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see http://www.gnu.org/licenses/ .
+# along with this program.  If not, see https://www.gnu.org/licenses/ .
 
 # These variables must be set before the inclusion of test-lib.sh below,
 # because it will change our working directory.
@@ -31,7 +31,7 @@ unset GIT_CONFIG_NOSYSTEM
 GIT_CONFIG_SYSTEM="$TEST_DIRECTORY/perf/config"
 export GIT_CONFIG_SYSTEM
 
-if test -n "$GIT_TEST_INSTALLED" -a -z "$PERF_SET_GIT_TEST_INSTALLED"
+if test -n "$GIT_TEST_INSTALLED" && test -z "$PERF_SET_GIT_TEST_INSTALLED"
 then
 	error "Do not use GIT_TEST_INSTALLED with the perf tests.
 
@@ -48,6 +48,9 @@ export TEST_DIRECTORY TRASH_DIRECTORY GIT_BUILD_DIR GIT_TEST_CMP
 
 MODERN_GIT=$GIT_BUILD_DIR/bin-wrappers/git
 export MODERN_GIT
+
+MODERN_SCALAR=$GIT_BUILD_DIR/bin-wrappers/scalar
+export MODERN_SCALAR
 
 perf_results_dir=$TEST_RESULTS_DIR
 test -n "$GIT_PERF_SUBSECTION" && perf_results_dir="$perf_results_dir/$GIT_PERF_SUBSECTION"
@@ -120,6 +123,10 @@ test_perf_create_repo_from () {
 			# status" due to a locked index. Since we have
 			# a copy it's fine to remove the lock.
 			rm .git/index.lock
+		fi &&
+		if test_bool_env GIT_PERF_USE_SCALAR false
+		then
+			"$MODERN_SCALAR" register
 		fi
 	) || error "failed to copy repository '$source' to '$repo'"
 }
@@ -130,7 +137,11 @@ test_perf_fresh_repo () {
 	"$MODERN_GIT" init -q "$repo" &&
 	(
 		cd "$repo" &&
-		test_perf_do_repo_symlink_config_
+		test_perf_do_repo_symlink_config_ &&
+		if test_bool_env GIT_PERF_USE_SCALAR false
+		then
+			"$MODERN_SCALAR" register
+		fi
 	)
 }
 
@@ -271,7 +282,7 @@ test_perf_ () {
 #	Run the performance test script specified in perf-test with
 #	optional prerequisite and setup steps.
 # Options:
-#	--prereq prerequisites: Skip the test if prequisites aren't met
+#	--prereq prerequisites: Skip the test if prerequisites aren't met
 #	--setup "setup-steps": Run setup steps prior to each measured iteration
 #
 test_perf () {
@@ -298,7 +309,7 @@ test_size_ () {
 #	prerequisites and setup steps. Returns the numeric value
 #	returned by size-test.
 # Options:
-#	--prereq prerequisites: Skip the test if prequisites aren't met
+#	--prereq prerequisites: Skip the test if prerequisites aren't met
 #	--setup "setup-steps": Run setup steps prior to the size measurement
 
 test_size () {

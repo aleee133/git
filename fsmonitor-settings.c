@@ -1,10 +1,14 @@
-#include "cache.h"
+#include "git-compat-util.h"
 #include "config.h"
+#include "gettext.h"
 #include "repository.h"
+#include "fsmonitor-ipc.h"
 #include "fsmonitor-settings.h"
+#include "fsmonitor-path-utils.h"
+#include "advice.h"
 
 /*
- * We keep this structure defintion private and have getters
+ * We keep this structure definition private and have getters
  * for all fields so that we can lazy load it as needed.
  */
 struct fsmonitor_settings {
@@ -13,7 +17,54 @@ struct fsmonitor_settings {
 	char *hook_path;
 };
 
-static enum fsmonitor_reason check_for_incompatible(struct repository *r)
+/*
+ * Remote working directories are problematic for FSMonitor.
+ *
+ * The underlying file system on the server machine and/or the remote
+ * mount type dictates whether notification events are available at
+ * all to remote client machines.
+ *
+ * Kernel differences between the server and client machines also
+ * dictate the how (buffering, frequency, de-dup) the events are
+ * delivered to client machine processes.
+ *
+ * A client machine (such as a laptop) may choose to suspend/resume
+ * and it is unclear (without lots of testing) whether the watcher can
+ * resync after a resume.  We might be able to treat this as a normal
+ * "events were dropped by the kernel" event and do our normal "flush
+ * and resync" --or-- we might need to close the existing (zombie?)
+ * notification fd and create a new one.
+ *
+ * In theory, the above issues need to be addressed whether we are
+ * using the Hook or IPC API.
+ *
+ * So (for now at least), mark remote working directories as
+ * incompatible unless 'fsmonitor.allowRemote' is true.
+ *
+ */
+#ifdef HAVE_FSMONITOR_OS_SETTINGS
+static enum fsmonitor_reason check_remote(struct repository *r)
+{
+	int allow_remote = -1; /* -1 unset, 0 not allowed, 1 allowed */
+	int is_remote = fsmonitor__is_fs_remote(r->worktree);
+
+	switch (is_remote) {
+		case 0:
+			return FSMONITOR_REASON_OK;
+		case 1:
+			repo_config_get_bool(r, "fsmonitor.allowremote", &allow_remote);
+			if (allow_remote < 1)
+				return FSMONITOR_REASON_REMOTE;
+			else
+				return FSMONITOR_REASON_OK;
+		default:
+			return FSMONITOR_REASON_ERROR;
+	}
+}
+#endif
+
+static enum fsmonitor_reason check_for_incompatible(struct repository *r,
+						    int ipc MAYBE_UNUSED)
 {
 	if (!r->worktree) {
 		/*
@@ -27,7 +78,10 @@ static enum fsmonitor_reason check_for_incompatible(struct repository *r)
 	{
 		enum fsmonitor_reason reason;
 
-		reason = fsm_os__incompatible(r);
+		reason = check_remote(r);
+		if (reason != FSMONITOR_REASON_OK)
+			return reason;
+		reason = fsm_os__incompatible(r, ipc);
 		if (reason != FSMONITOR_REASON_OK)
 			return reason;
 	}
@@ -75,6 +129,7 @@ static int check_deprecated_builtin_config(struct repository *r)
 static void lookup_fsmonitor_settings(struct repository *r)
 {
 	const char *const_str;
+	char *to_free = NULL;
 	int bool_value;
 
 	if (r->settings.fsmonitor)
@@ -105,8 +160,9 @@ static void lookup_fsmonitor_settings(struct repository *r)
 
 	case -1: /* config value set to an arbitrary string */
 		if (check_deprecated_builtin_config(r) ||
-		    repo_config_get_pathname(r, "core.fsmonitor", &const_str))
+		    repo_config_get_pathname(r, "core.fsmonitor", &to_free))
 			return;
+		const_str = to_free;
 		break;
 
 	default: /* should not happen */
@@ -117,12 +173,11 @@ static void lookup_fsmonitor_settings(struct repository *r)
 		fsm_settings__set_hook(r, const_str);
 	else
 		fsm_settings__set_disabled(r);
+	free(to_free);
 }
 
 enum fsmonitor_mode fsm_settings__get_mode(struct repository *r)
 {
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		lookup_fsmonitor_settings(r);
 
@@ -131,8 +186,6 @@ enum fsmonitor_mode fsm_settings__get_mode(struct repository *r)
 
 const char *fsm_settings__get_hook_path(struct repository *r)
 {
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		lookup_fsmonitor_settings(r);
 
@@ -141,7 +194,7 @@ const char *fsm_settings__get_hook_path(struct repository *r)
 
 void fsm_settings__set_ipc(struct repository *r)
 {
-	enum fsmonitor_reason reason = check_for_incompatible(r);
+	enum fsmonitor_reason reason = check_for_incompatible(r, 1);
 
 	if (reason != FSMONITOR_REASON_OK) {
 		fsm_settings__set_incompatible(r, reason);
@@ -152,8 +205,6 @@ void fsm_settings__set_ipc(struct repository *r)
 	 * Caller requested IPC explicitly, so avoid (possibly
 	 * recursive) config lookup.
 	 */
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		r->settings.fsmonitor = alloc_settings();
 
@@ -164,7 +215,7 @@ void fsm_settings__set_ipc(struct repository *r)
 
 void fsm_settings__set_hook(struct repository *r, const char *path)
 {
-	enum fsmonitor_reason reason = check_for_incompatible(r);
+	enum fsmonitor_reason reason = check_for_incompatible(r, 0);
 
 	if (reason != FSMONITOR_REASON_OK) {
 		fsm_settings__set_incompatible(r, reason);
@@ -175,8 +226,6 @@ void fsm_settings__set_hook(struct repository *r, const char *path)
 	 * Caller requested hook explicitly, so avoid (possibly
 	 * recursive) config lookup.
 	 */
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		r->settings.fsmonitor = alloc_settings();
 
@@ -188,8 +237,6 @@ void fsm_settings__set_hook(struct repository *r, const char *path)
 
 void fsm_settings__set_disabled(struct repository *r)
 {
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		r->settings.fsmonitor = alloc_settings();
 
@@ -201,8 +248,6 @@ void fsm_settings__set_disabled(struct repository *r)
 void fsm_settings__set_incompatible(struct repository *r,
 				    enum fsmonitor_reason reason)
 {
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		r->settings.fsmonitor = alloc_settings();
 
@@ -213,18 +258,17 @@ void fsm_settings__set_incompatible(struct repository *r,
 
 enum fsmonitor_reason fsm_settings__get_reason(struct repository *r)
 {
-	if (!r)
-		r = the_repository;
 	if (!r->settings.fsmonitor)
 		lookup_fsmonitor_settings(r);
 
 	return r->settings.fsmonitor->reason;
 }
 
-char *fsm_settings__get_incompatible_msg(const struct repository *r,
+char *fsm_settings__get_incompatible_msg(struct repository *r,
 					 enum fsmonitor_reason reason)
 {
 	struct strbuf msg = STRBUF_INIT;
+	const char *socket_dir;
 
 	switch (reason) {
 	case FSMONITOR_REASON_UNTESTED:
@@ -260,9 +304,11 @@ char *fsm_settings__get_incompatible_msg(const struct repository *r,
 		goto done;
 
 	case FSMONITOR_REASON_NOSOCKETS:
+		socket_dir = dirname((char *)fsmonitor_ipc__get_path(r));
 		strbuf_addf(&msg,
-			    _("repository '%s' is incompatible with fsmonitor due to lack of Unix sockets"),
-			    r->worktree);
+			    _("socket directory '%s' is incompatible with fsmonitor due"
+			      " to lack of Unix sockets support"),
+			    socket_dir);
 		goto done;
 	}
 

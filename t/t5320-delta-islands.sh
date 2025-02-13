@@ -2,7 +2,6 @@
 
 test_description='exercise delta islands'
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 # returns true iff $1 is a delta based on $2
@@ -134,7 +133,7 @@ test_expect_success 'island core places core objects first' '
 	    repack -adfi &&
 	git verify-pack -v .git/objects/pack/*.pack |
 	cut -d" " -f1 |
-	egrep "$root|$two" >actual &&
+	grep -E "$root|$two" >actual &&
 	test_cmp expect actual
 '
 

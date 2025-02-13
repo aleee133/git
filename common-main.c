@@ -1,6 +1,13 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
 #include "exec-cmd.h"
+#include "gettext.h"
 #include "attr.h"
+#include "repository.h"
+#include "setup.h"
+#include "strbuf.h"
+#include "trace2.h"
 
 /*
  * Many parts of Git have subprograms communicate via pipe, expect the
@@ -40,9 +47,10 @@ int main(int argc, const char **argv)
 
 	git_resolve_executable_dir(argv[0]);
 
+	setlocale(LC_CTYPE, "");
 	git_setup_gettext();
 
-	initialize_the_repository();
+	initialize_repository(the_repository);
 
 	attr_start();
 
@@ -69,6 +77,13 @@ static void check_bug_if_BUG(void)
 /* We wrap exit() to call common_exit() in git-compat-util.h */
 int common_exit(const char *file, int line, int code)
 {
+	/*
+	 *  Windows Filtering Platform driver provided by the security software
+	 * may change buffer type of stdout from _IONBF to _IOFBF.
+	 * It will no output without fflush manually.
+	 */
+	fflush(stdout);
+
 	/*
 	 * For non-POSIX systems: Take the lowest 8 bits of the "code"
 	 * to e.g. turn -1 into 255. On a POSIX system this is

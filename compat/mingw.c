@@ -1,3 +1,6 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "../git-compat-util.h"
 #include "win32.h"
 #include <aclapi.h>
@@ -7,23 +10,31 @@
 #include <winioctl.h>
 #include "../strbuf.h"
 #include "../run-command.h"
-#include "../cache.h"
+#include "../abspath.h"
+#include "../alloc.h"
 #include "win32/exit-process.h"
 #include "win32/lazyload.h"
 #include "../config.h"
+#include "../environment.h"
+#include "../trace2.h"
+#include "../symlinks.h"
+#include "../wrapper.h"
 #include "dir.h"
+#include "gettext.h"
 #define SECURITY_WIN32
 #include <sspi.h>
+#include "../write-or-die.h"
+#include "../repository.h"
 #include "win32/fscache.h"
 #include "../attr.h"
 #include "../string-list.h"
+#include "win32/wsl.h"
 
 #define HCAST(type, handle) ((type)(intptr_t)handle)
 
 void open_in_gdb(void)
 {
 	static struct child_process cp = CHILD_PROCESS_INIT;
-	extern char *_pgmptr;
 
 	strvec_pushl(&cp.args, "mintty", "gdb", NULL);
 	strvec_pushf(&cp.args, "--pid=%d", getpid());
@@ -204,13 +215,16 @@ static int read_yes_no_answer(void)
 static int ask_yes_no_if_possible(const char *format, va_list args)
 {
 	char question[4096];
-	const char *retry_hook[] = { NULL, NULL, NULL };
+	const char *retry_hook;
 
 	vsnprintf(question, sizeof(question), format, args);
 
-	if ((retry_hook[0] = mingw_getenv("GIT_ASK_YESNO"))) {
-		retry_hook[1] = question;
-		return !run_command_v_opt(retry_hook, 0);
+	retry_hook = mingw_getenv("GIT_ASK_YESNO");
+	if (retry_hook) {
+		struct child_process cmd = CHILD_PROCESS_INIT;
+
+		strvec_pushl(&cmd.args, retry_hook, question, NULL);
+		return !run_command(&cmd);
 	}
 
 	if (!isatty(_fileno(stdin)) || !isatty(_fileno(stderr)))
@@ -264,9 +278,31 @@ static int core_restrict_inherited_handles = -1;
 static enum hide_dotfiles_type hide_dotfiles = HIDE_DOTFILES_DOTGITONLY;
 static char *unset_environment_variables;
 int core_fscache;
-int core_long_paths;
 
-int mingw_core_config(const char *var, const char *value, void *cb)
+int are_long_paths_enabled(void)
+{
+	/* default to `false` during initialization */
+	static const int fallback = 0;
+
+	static int enabled = -1;
+
+	if (enabled < 0) {
+		/* avoid infinite recursion */
+		if (!the_repository)
+			return fallback;
+
+		if (the_repository->config &&
+		    the_repository->config->hash_initialized &&
+		    git_config_get_bool("core.longpaths", &enabled) < 0)
+			enabled = 0;
+	}
+
+	return enabled < 0 ? fallback : enabled;
+}
+
+int mingw_core_config(const char *var, const char *value,
+		      const struct config_context *ctx UNUSED,
+		      void *cb UNUSED)
 {
 	if (!strcmp(var, "core.hidedotfiles")) {
 		if (value && !strcasecmp(value, "dotgitonly"))
@@ -281,12 +317,9 @@ int mingw_core_config(const char *var, const char *value, void *cb)
 		return 0;
 	}
 
-	if (!strcmp(var, "core.longpaths")) {
-		core_long_paths = git_config_bool(var, value);
-		return 0;
-	}
-
 	if (!strcmp(var, "core.unsetenvvars")) {
+		if (!value)
+			return config_error_nonbool(var);
 		free(unset_environment_variables);
 		unset_environment_variables = xstrdup(value);
 		return 0;
@@ -303,14 +336,6 @@ int mingw_core_config(const char *var, const char *value, void *cb)
 
 	return 0;
 }
-
-static DWORD symlink_file_flags = 0, symlink_directory_flags = 1;
-
-enum phantom_symlink_result {
-	PHANTOM_SYMLINK_RETRY,
-	PHANTOM_SYMLINK_DONE,
-	PHANTOM_SYMLINK_DIRECTORY
-};
 
 static inline int is_wdir_sep(wchar_t wchar)
 {
@@ -346,6 +371,14 @@ static const wchar_t *make_relative_to(const wchar_t *path,
 	wcscpy(out + i, path);
 	return out;
 }
+
+static DWORD symlink_file_flags = 0, symlink_directory_flags = 1;
+
+enum phantom_symlink_result {
+	PHANTOM_SYMLINK_RETRY,
+	PHANTOM_SYMLINK_DONE,
+	PHANTOM_SYMLINK_DIRECTORY
+};
 
 /*
  * Changes a file symlink to a directory symlink if the target exists and is a
@@ -647,7 +680,7 @@ static int set_hidden_flag(const wchar_t *path, int set)
 	return -1;
 }
 
-int mingw_mkdir(const char *path, int mode)
+int mingw_mkdir(const char *path, int mode UNUSED)
 {
 	int ret;
 	wchar_t wpath[MAX_LONG_PATH];
@@ -659,7 +692,7 @@ int mingw_mkdir(const char *path, int mode)
 
 	/* CreateDirectoryW path limit is 248 (MAX_PATH - 8.3 file name) */
 	if (xutftowcs_path_ex(wpath, path, MAX_LONG_PATH, -1, 248,
-			core_long_paths) < 0)
+			      are_long_paths_enabled()) < 0)
 		return -1;
 
 	ret = _wmkdir(wpath);
@@ -698,7 +731,7 @@ static int mingw_open_append(wchar_t const *wfilename, int oflags, ...)
 	 * to append to the file.
 	 */
 	handle = CreateFileW(wfilename, FILE_APPEND_DATA,
-			FILE_SHARE_WRITE | FILE_SHARE_READ,
+			FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
 			NULL, create, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		DWORD err = GetLastError();
@@ -723,6 +756,81 @@ static int mingw_open_append(wchar_t const *wfilename, int oflags, ...)
 	 * FILE_APPEND_DATA.
 	 */
 	fd = _open_osfhandle((intptr_t)handle, O_BINARY);
+	if (fd < 0)
+		CloseHandle(handle);
+	return fd;
+}
+
+/*
+ * Ideally, we'd use `_wopen()` to implement this functionality so that we
+ * don't have to reimplement it, but unfortunately we do not have tight control
+ * over the share mode there. And while `_wsopen()` and friends exist that give
+ * us _some_ control over the share mode, this family of functions doesn't give
+ * us the ability to enable FILE_SHARE_DELETE, either. But this is a strict
+ * requirement for us though so that we can unlink or rename over files that
+ * are held open by another process.
+ *
+ * We are thus forced to implement our own emulation of `open()`. To make our
+ * life simpler we only implement basic support for this, namely opening
+ * existing files for reading and/or writing. This means that newly created
+ * files won't have their sharing mode set up correctly, but for now I couldn't
+ * find any case where this matters. We may have to revisit that in the future
+ * though based on our needs.
+ */
+static int mingw_open_existing(const wchar_t *filename, int oflags, ...)
+{
+	SECURITY_ATTRIBUTES security_attributes = {
+		.nLength = sizeof(security_attributes),
+		.bInheritHandle = !(oflags & O_NOINHERIT),
+	};
+	HANDLE handle;
+	DWORD access;
+	int fd;
+
+	/* We only support basic flags. */
+	if (oflags & ~(O_ACCMODE | O_NOINHERIT)) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	switch (oflags & O_ACCMODE) {
+	case O_RDWR:
+		access = GENERIC_READ | GENERIC_WRITE;
+		break;
+	case O_WRONLY:
+		access = GENERIC_WRITE;
+		break;
+	default:
+		access = GENERIC_READ;
+		break;
+	}
+
+	handle = CreateFileW(filename, access,
+			     FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+			     &security_attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (handle == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+		if (err == ERROR_ACCESS_DENIED) {
+			DWORD attrs = GetFileAttributesW(filename);
+			if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+				handle = CreateFileW(filename, access,
+							FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+							&security_attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL| FILE_FLAG_BACKUP_SEMANTICS, NULL);
+		}
+
+		if (handle == INVALID_HANDLE_VALUE) {
+			err = GetLastError();
+
+			/* See `mingw_open_append()` for why we have this conversion. */
+			if (err == ERROR_INVALID_PARAMETER)
+				err = ERROR_PATH_NOT_FOUND;
+
+			errno = err_win_to_posix(err);
+			return -1;
+		}
+	}
+
+	fd = _open_osfhandle((intptr_t)handle, oflags | O_BINARY);
 	if (fd < 0)
 		CloseHandle(handle);
 	return fd;
@@ -773,6 +881,8 @@ int mingw_open (const char *filename, int oflags, ...)
 	if (append_atomically && (oflags & O_APPEND) &&
 		!is_local_named_pipe_path(filename))
 		open_fn = mingw_open_append;
+	else if (!(oflags & ~(O_ACCMODE | O_NOINHERIT)))
+		open_fn = mingw_open_existing;
 	else
 		open_fn = _wopen;
 
@@ -782,6 +892,11 @@ int mingw_open (const char *filename, int oflags, ...)
 		return -1;
 
 	fd = open_fn(wfilename, oflags, mode);
+
+	if ((oflags & O_CREAT) && fd >= 0 && are_wsl_compatible_mode_bits_enabled()) {
+		_mode_t wsl_mode = S_IFREG | (mode&0777);
+		set_wsl_mode_bits_by_handle((HANDLE)_get_osfhandle(fd), wsl_mode);
+	}
 
 	if (fd < 0 && (oflags & O_ACCMODE) != O_RDONLY && errno == EACCES) {
 		DWORD attrs = GetFileAttributesW(wfilename);
@@ -806,7 +921,7 @@ int mingw_open (const char *filename, int oflags, ...)
 	return fd;
 }
 
-static BOOL WINAPI ctrl_ignore(DWORD type)
+static BOOL WINAPI ctrl_ignore(DWORD type UNUSED)
 {
 	return TRUE;
 }
@@ -915,30 +1030,42 @@ ssize_t mingw_write(int fd, const void *buf, size_t len)
 {
 	ssize_t result = write(fd, buf, len);
 
-	if (result < 0 && errno == EINVAL && buf) {
+	if (result < 0 && (errno == EINVAL || errno == EBADF || errno == ENOSPC) && buf) {
+		int orig = errno;
+
 		/* check if fd is a pipe */
 		HANDLE h = (HANDLE) _get_osfhandle(fd);
-		if (GetFileType(h) == FILE_TYPE_PIPE)
+		if (GetFileType(h) != FILE_TYPE_PIPE) {
+			if (orig == EINVAL) {
+				wchar_t path[MAX_LONG_PATH];
+				DWORD ret = GetFinalPathNameByHandleW(h, path,
+								ARRAY_SIZE(path), 0);
+				UINT drive_type = ret > 0 && ret < ARRAY_SIZE(path) ?
+					GetDriveTypeW(path) : DRIVE_UNKNOWN;
+
+				/*
+				 * The default atomic append causes such an error on
+				 * network file systems, in such a case, it should be
+				 * turned off via config.
+				 *
+				 * `drive_type` of UNC path: DRIVE_NO_ROOT_DIR
+				 */
+				if (DRIVE_NO_ROOT_DIR == drive_type || DRIVE_REMOTE == drive_type)
+					warning("invalid write operation detected; you may try:\n"
+						"\n\tgit config windows.appendAtomically false");
+			}
+
+			errno = orig;
+		} else if (orig == EINVAL || errno == EBADF)
 			errno = EPIPE;
 		else {
-			wchar_t path[MAX_LONG_PATH];
-			DWORD ret = GetFinalPathNameByHandleW(h, path,
-							ARRAY_SIZE(path), 0);
-			UINT drive_type = ret > 0 && ret < ARRAY_SIZE(path) ?
-				GetDriveTypeW(path) : DRIVE_UNKNOWN;
+			DWORD buf_size;
 
-			/*
-			 * The default atomic append causes such an error on
-			 * network file systems, in such a case, it should be
-			 * turned off via config.
-			 *
-			 * `drive_type` of UNC path: DRIVE_NO_ROOT_DIR
-			 */
-			if (DRIVE_NO_ROOT_DIR == drive_type || DRIVE_REMOTE == drive_type)
-				warning("invalid write operation detected; you may try:\n"
-					"\n\tgit config windows.appendAtomically false");
-
-			errno = EINVAL;
+			if (!GetNamedPipeInfo(h, NULL, NULL, &buf_size, NULL))
+				buf_size = 4096;
+			if (len > buf_size)
+				return write(fd, buf, buf_size);
+			errno = orig;
 		}
 	}
 
@@ -1000,7 +1127,7 @@ int mingw_chmod(const char *filename, int mode)
  */
 static int has_valid_directory_prefix(wchar_t *wfilename)
 {
-	int n = wcslen(wfilename);
+	size_t n = wcslen(wfilename);
 
 	while (n > 0) {
 		wchar_t c = wfilename[--n];
@@ -1070,6 +1197,11 @@ int mingw_lstat(const char *file_name, struct stat *buf)
 		filetime_to_timespec(&(fdata.ftLastAccessTime), &(buf->st_atim));
 		filetime_to_timespec(&(fdata.ftLastWriteTime), &(buf->st_mtim));
 		filetime_to_timespec(&(fdata.ftCreationTime), &(buf->st_ctim));
+		if (S_ISREG(buf->st_mode) &&
+		    are_wsl_compatible_mode_bits_enabled()) {
+			copy_wsl_mode_bits_from_disk(wfilename, -1,
+						     &buf->st_mode);
+		}
 		return 0;
 	}
 
@@ -1121,6 +1253,8 @@ static int get_file_info_by_handle(HANDLE hnd, struct stat *buf)
 	filetime_to_timespec(&(fdata.ftLastAccessTime), &(buf->st_atim));
 	filetime_to_timespec(&(fdata.ftLastWriteTime), &(buf->st_mtim));
 	filetime_to_timespec(&(fdata.ftCreationTime), &(buf->st_ctim));
+	if (are_wsl_compatible_mode_bits_enabled())
+	    get_wsl_mode_bits_by_handle(hnd, &buf->st_mode);
 	return 0;
 }
 
@@ -1215,7 +1349,7 @@ int mingw_utime (const char *file_name, const struct utimbuf *times)
 
 	osfilehandle = CreateFileW(wfilename,
 				   FILE_WRITE_ATTRIBUTES,
-				   0 /*FileShare.None*/,
+				   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				   NULL,
 				   OPEN_EXISTING,
 				   (attrs != INVALID_FILE_ATTRIBUTES &&
@@ -1309,7 +1443,7 @@ int mkstemp(char *template)
 	return git_mkstemp_mode(template, 0600);
 }
 
-int gettimeofday(struct timeval *tv, void *tz)
+int gettimeofday(struct timeval *tv, void *tz UNUSED)
 {
 	FILETIME ft;
 	long long hnsec;
@@ -1368,6 +1502,7 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
 	DWORD ret;
 	int len;
 	const char *last_component = NULL;
+	char *append = NULL;
 
 	if (xutftowcs_path(wpath, path) < 0)
 		return NULL;
@@ -1390,8 +1525,16 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
 				break; /* found start of last component */
 
 		if (p != wpath && (last_component = find_last_dir_sep(path))) {
-			last_component++; /* skip directory separator */
-			*p = L'\0';
+			append = xstrdup(last_component + 1); /* skip directory separator */
+			/*
+			 * Do not strip the trailing slash at the drive root, otherwise
+			 * the path would be e.g. `C:` (which resolves to the
+			 * _current_ directory on that drive).
+			 */
+			if (p[-1] == L':')
+				p[1] = L'\0';
+			else
+				*p = L'\0';
 			h = CreateFileW(wpath, 0, FILE_SHARE_READ |
 					FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 					NULL, OPEN_EXISTING,
@@ -1399,25 +1542,29 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
 		}
 	}
 
-	if (h == INVALID_HANDLE_VALUE)
+	if (h == INVALID_HANDLE_VALUE) {
+realpath_failed:
+		FREE_AND_NULL(append);
 		return NULL;
+	}
 
 	ret = GetFinalPathNameByHandleW(h, wpath, ARRAY_SIZE(wpath), 0);
 	CloseHandle(h);
 	if (!ret || ret >= ARRAY_SIZE(wpath))
-		return NULL;
+		goto realpath_failed;
 
 	len = wcslen(wpath) * 3;
 	strbuf_grow(resolved, len);
 	len = xwcstoutf(resolved->buf, normalize_ntpath(wpath), len);
 	if (len < 0)
-		return NULL;
+		goto realpath_failed;
 	resolved->len = len;
 
-	if (last_component) {
+	if (append) {
 		/* Use forward-slash, like `normalize_ntpath()` */
-		strbuf_addch(resolved, '/');
-		strbuf_addstr(resolved, last_component);
+		strbuf_complete(resolved, '/');
+		strbuf_addstr(resolved, append);
+		FREE_AND_NULL(append);
 	}
 
 	return resolved->buf;
@@ -1559,7 +1706,8 @@ static const char *parse_interpreter(const char *cmd)
 {
 	static char buf[MAX_PATH];
 	char *p, *opt;
-	int n, fd;
+	ssize_t n; /* read() can return negative values */
+	int fd;
 
 	/* don't even try a .exe */
 	n = strlen(cmd);
@@ -1683,7 +1831,7 @@ static char *path_lookup(const char *cmd, int exe_only)
 {
 	const char *path;
 	char *prog = NULL;
-	int len = strlen(cmd);
+	size_t len = strlen(cmd);
 	int isexe = len >= 4 && !strcasecmp(cmd+len-4, ".exe");
 
 	if (strpbrk(cmd, "/\\"))
@@ -1707,6 +1855,11 @@ static char *path_lookup(const char *cmd, int exe_only)
 		prog = is_busybox_applet(cmd);
 
 	return prog;
+}
+
+char *mingw_locate_in_PATH(const char *cmd)
+{
+	return path_lookup(cmd, 0);
 }
 
 static const wchar_t *wcschrnul(const wchar_t *s, wchar_t c)
@@ -1765,8 +1918,7 @@ static wchar_t *make_environment_block(char **deltaenv)
 			p += s;
 		}
 
-		ALLOC_ARRAY(result, size);
-		COPY_ARRAY(result, wenv, size);
+		DUP_ARRAY(result, wenv, size);
 		FreeEnvironmentStringsW(wenv);
 		return result;
 	}
@@ -1892,7 +2044,7 @@ static int is_msys2_sh(const char *cmd)
 		return ret;
 	}
 
-	if (ends_with(cmd, "\\sh.exe")) {
+	if (ends_with(cmd, "\\sh.exe") || ends_with(cmd, "/sh.exe")) {
 		static char *sh;
 
 		if (!sh)
@@ -2213,16 +2365,13 @@ static int try_shell_exec(const char *cmd, char *const *argv)
 	if (prog) {
 		int exec_id;
 		int argc = 0;
-#ifndef _MSC_VER
-		const
-#endif
 		char **argv2;
 		while (argv[argc]) argc++;
 		ALLOC_ARRAY(argv2, argc + 1);
 		argv2[0] = (char *)cmd;	/* full path to the script file */
 		COPY_ARRAY(&argv2[1], &argv[1], argc);
-		exec_id = trace2_exec(prog, argv2);
-		pid = mingw_spawnv(prog, argv2, interpr);
+		exec_id = trace2_exec(prog, (const char **)argv2);
+		pid = mingw_spawnv(prog, (const char **)argv2, interpr);
 		if (pid >= 0) {
 			int status;
 			if (waitpid(pid, &status, 0) < 0)
@@ -2319,7 +2468,7 @@ char *mingw_getenv(const char *name)
 #define GETENV_MAX_RETAIN 64
 	static char *values[GETENV_MAX_RETAIN];
 	static int value_counter;
-	int len_key, len_value;
+	size_t len_key, len_value;
 	wchar_t *w_key;
 	char *value;
 	wchar_t w_value[32768];
@@ -2331,7 +2480,8 @@ char *mingw_getenv(const char *name)
 	/* We cannot use xcalloc() here because that uses getenv() itself */
 	w_key = calloc(len_key, sizeof(wchar_t));
 	if (!w_key)
-		die("Out of memory, (tried to allocate %u wchar_t's)", len_key);
+		die("Out of memory, (tried to allocate %"PRIuMAX" wchar_t's)",
+			(uintmax_t)len_key);
 	xutftowcs(w_key, name, len_key);
 	/* GetEnvironmentVariableW() only sets the last error upon failure */
 	SetLastError(ERROR_SUCCESS);
@@ -2346,7 +2496,8 @@ char *mingw_getenv(const char *name)
 	/* We cannot use xcalloc() here because that uses getenv() itself */
 	value = calloc(len_value, sizeof(char));
 	if (!value)
-		die("Out of memory, (tried to allocate %u bytes)", len_value);
+		die("Out of memory, (tried to allocate %"PRIuMAX" bytes)",
+			(uintmax_t)len_value);
 	xwcstoutf(value, w_value, len_value);
 
 	/*
@@ -2364,7 +2515,7 @@ char *mingw_getenv(const char *name)
 
 int mingw_putenv(const char *namevalue)
 {
-	int size;
+	size_t size;
 	wchar_t *wide, *equal;
 	BOOL result;
 
@@ -2374,7 +2525,8 @@ int mingw_putenv(const char *namevalue)
 	size = strlen(namevalue) * 2 + 1;
 	wide = calloc(size, sizeof(wchar_t));
 	if (!wide)
-		die("Out of memory, (tried to allocate %u wchar_t's)", size);
+		die("Out of memory, (tried to allocate %" PRIuMAX " wchar_t's)",
+		    (uintmax_t)size);
 	xutftowcs(wide, namevalue, size);
 	equal = wcschr(wide, L'=');
 	if (!equal)
@@ -2532,6 +2684,91 @@ static inline int winsock_return(int ret)
 
 #define WINSOCK_RETURN(x) do { return winsock_return(x); } while (0)
 
+#undef strerror
+char *mingw_strerror(int errnum)
+{
+	static char buf[41] ="";
+	switch (errnum) {
+		case EWOULDBLOCK:
+			xsnprintf(buf, 41, "%s", "Operation would block");
+			break;
+		case EINPROGRESS:
+			xsnprintf(buf, 41, "%s", "Operation now in progress");
+			break;
+		case EALREADY:
+			xsnprintf(buf, 41, "%s", "Operation already in progress");
+			break;
+		case ENOTSOCK:
+			xsnprintf(buf, 41, "%s", "Socket operation on non-socket");
+			break;
+		case EDESTADDRREQ:
+			xsnprintf(buf, 41, "%s", "Destination address required");
+			break;
+		case EMSGSIZE:
+			xsnprintf(buf, 41, "%s", "Message too long");
+			break;
+		case EPROTOTYPE:
+			xsnprintf(buf, 41, "%s", "Protocol wrong type for socket");
+			break;
+		case ENOPROTOOPT:
+			xsnprintf(buf, 41, "%s", "Protocol not available");
+			break;
+		case EPROTONOSUPPORT:
+			xsnprintf(buf, 41, "%s", "Protocol not supported");
+			break;
+		case EOPNOTSUPP:
+			xsnprintf(buf, 41, "%s", "Operation not supported");
+			break;
+		case EAFNOSUPPORT:
+			xsnprintf(buf, 41, "%s", "Address family not supported by protocol");
+			break;
+		case EADDRINUSE:
+			xsnprintf(buf, 41, "%s", "Address already in use");
+			break;
+		case EADDRNOTAVAIL:
+			xsnprintf(buf, 41, "%s", "Cannot assign requested address");
+			break;
+		case ENETDOWN:
+			xsnprintf(buf, 41, "%s", "Network is down");
+			break;
+		case ENETUNREACH:
+			xsnprintf(buf, 41, "%s", "Network is unreachable");
+			break;
+		case ENETRESET:
+			xsnprintf(buf, 41, "%s", "Network dropped connection on reset");
+			break;
+		case ECONNABORTED:
+			xsnprintf(buf, 41, "%s", "Software caused connection abort");
+			break;
+		case ECONNRESET:
+			xsnprintf(buf, 41, "%s", "Connection reset by peer");
+			break;
+		case ENOBUFS:
+			xsnprintf(buf, 41, "%s", "No buffer space available");
+			break;
+		case EISCONN:
+			xsnprintf(buf, 41, "%s", "Transport endpoint is already connected");
+			break;
+		case ENOTCONN:
+			xsnprintf(buf, 41, "%s", "Transport endpoint is not connected");
+			break;
+		case ETIMEDOUT:
+			xsnprintf(buf, 41, "%s", "Connection timed out");
+			break;
+		case ECONNREFUSED:
+			xsnprintf(buf, 41, "%s", "Connection refused");
+			break;
+		case ELOOP:
+			xsnprintf(buf, 41, "%s", "Too many levels of symbolic links");
+			break;
+		case EHOSTUNREACH:
+			xsnprintf(buf, 41, "%s", "No route to host");
+			break;
+		default: return strerror(errnum);
+	}
+	return buf;
+}
+
 #undef gethostname
 int mingw_gethostname(char *name, int namelen)
 {
@@ -2569,15 +2806,6 @@ int mingw_socket(int domain, int type, int protocol)
 	ensure_socket_initialization();
 	s = WSASocket(domain, type, protocol, NULL, 0, 0);
 	if (s == INVALID_SOCKET) {
-		/*
-		 * WSAGetLastError() values are regular BSD error codes
-		 * biased by WSABASEERR.
-		 * However, strerror() does not know about networking
-		 * specific errors, which are values beginning at 38 or so.
-		 * Therefore, we choose to leave the biased error code
-		 * in errno so that _if_ someone looks up the code somewhere,
-		 * then it is at least the number that are usually listed.
-		 */
 		set_wsa_errno();
 		return -1;
 	}
@@ -2651,24 +2879,113 @@ int mingw_accept(int sockfd1, struct sockaddr *sa, socklen_t *sz)
 #undef rename
 int mingw_rename(const char *pold, const char *pnew)
 {
-	DWORD attrs = INVALID_FILE_ATTRIBUTES, gle;
+	static int supports_file_rename_info_ex = 1;
+	DWORD attrs = INVALID_FILE_ATTRIBUTES, gle, attrsold;
 	int tries = 0;
 	wchar_t wpold[MAX_LONG_PATH], wpnew[MAX_LONG_PATH];
-	if (xutftowcs_long_path(wpold, pold) < 0 ||
-	    xutftowcs_long_path(wpnew, pnew) < 0)
+	int wpnew_len;
+
+	if (xutftowcs_long_path(wpold, pold) < 0)
+		return -1;
+	wpnew_len = xutftowcs_long_path(wpnew, pnew);
+	if (wpnew_len < 0)
 		return -1;
 
 repeat:
-	if (MoveFileExW(wpold, wpnew,
-			MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
-		return 0;
-	gle = GetLastError();
+	if (supports_file_rename_info_ex) {
+		/*
+		 * Our minimum required Windows version is still set to Windows
+		 * Vista. We thus have to declare required infrastructure for
+		 * FileRenameInfoEx ourselves until we bump _WIN32_WINNT to
+		 * 0x0A00. Furthermore, we have to handle cases where the
+		 * FileRenameInfoEx call isn't supported yet.
+		 */
+#define FILE_RENAME_FLAG_REPLACE_IF_EXISTS                  0x00000001
+#define FILE_RENAME_FLAG_POSIX_SEMANTICS                    0x00000002
+		FILE_INFO_BY_HANDLE_CLASS FileRenameInfoEx = 22;
+		struct {
+			/*
+			 * This is usually an unnamed union, but that is not
+			 * part of ISO C99. We thus inline the field, as we
+			 * really only care for the Flags field anyway.
+			 */
+			DWORD Flags;
+			HANDLE RootDirectory;
+			DWORD FileNameLength;
+			/*
+			 * The actual structure is defined with a single-character
+			 * flex array so that the structure has to be allocated on
+			 * the heap. As we declare this structure ourselves though
+			 * we can avoid the allocation and define FileName to have
+			 * MAX_PATH bytes.
+			 */
+			WCHAR FileName[MAX_PATH];
+		} rename_info = { 0 };
+		HANDLE old_handle = INVALID_HANDLE_VALUE;
+		BOOL success;
 
-	if (gle == ERROR_ACCESS_DENIED && is_inside_windows_container()) {
-		/* Fall back to copy to destination & remove source */
-		if (CopyFileW(wpold, wpnew, FALSE) && !mingw_unlink(pold))
+		old_handle = CreateFileW(wpold, DELETE,
+					 FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+					 NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+		if (old_handle == INVALID_HANDLE_VALUE) {
+			errno = err_win_to_posix(GetLastError());
+			return -1;
+		}
+
+		rename_info.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS |
+				    FILE_RENAME_FLAG_POSIX_SEMANTICS;
+		rename_info.FileNameLength = wpnew_len * sizeof(WCHAR);
+		memcpy(rename_info.FileName, wpnew, wpnew_len * sizeof(WCHAR));
+
+		success = SetFileInformationByHandle(old_handle, FileRenameInfoEx,
+						     &rename_info, sizeof(rename_info));
+		gle = GetLastError();
+		CloseHandle(old_handle);
+		if (success)
+			return 0;
+
+		/*
+		 * When we see ERROR_INVALID_PARAMETER we can assume that the
+		 * current system doesn't support FileRenameInfoEx. Keep us
+		 * from using it in future calls and retry.
+		 */
+		if (gle == ERROR_INVALID_PARAMETER) {
+			supports_file_rename_info_ex = 0;
+			goto repeat;
+		}
+
+		/*
+		 * In theory, we shouldn't get ERROR_ACCESS_DENIED because we
+		 * always open files with FILE_SHARE_DELETE But in practice we
+		 * cannot assume that Git is the only one accessing files, and
+		 * other applications may not set FILE_SHARE_DELETE. So we have
+		 * to retry.
+		 */
+	} else {
+		if (MoveFileExW(wpold, wpnew,
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
 			return 0;
 		gle = GetLastError();
+	}
+
+	if (gle == ERROR_ACCESS_DENIED) {
+		if (is_inside_windows_container()) {
+			/* Fall back to copy to destination & remove source */
+			if (CopyFileW(wpold, wpnew, FALSE) && !mingw_unlink(pold))
+				return 0;
+			gle = GetLastError();
+		} else if ((attrsold = GetFileAttributesW(wpold)) & FILE_ATTRIBUTE_READONLY) {
+			/* if file is read-only, change and retry */
+			SetFileAttributesW(wpold, attrsold & ~FILE_ATTRIBUTE_READONLY);
+			if (MoveFileExW(wpold, wpnew,
+					MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+				SetFileAttributesW(wpnew, attrsold);
+				return 0;
+			}
+			gle = GetLastError();
+			/* revert attribute change on failure */
+			SetFileAttributesW(wpold, attrsold);
+		}
 	}
 
 	/* revert file attributes on failure */
@@ -2747,7 +3064,7 @@ char *mingw_query_user_email(void)
 	return get_extended_user_info(NameUserPrincipal);
 }
 
-struct passwd *getpwuid(int uid)
+struct passwd *getpwuid(int uid UNUSED)
 {
 	static unsigned initialized;
 	static char user_name[100];
@@ -2773,7 +3090,11 @@ struct passwd *getpwuid(int uid)
 	p->pw_name = user_name;
 	p->pw_gecos = get_extended_user_info(NameDisplay);
 	if (!p->pw_gecos)
-		p->pw_gecos = "unknown";
+		/*
+		 * Data returned by getpwuid(3P) is treated as internal and
+		 * must never be written to or freed.
+		 */
+		p->pw_gecos = (char *) "unknown";
 	p->pw_dir = NULL;
 
 	initialized = 1;
@@ -2795,7 +3116,7 @@ static sig_handler_t timer_fn = SIG_DFL, sigint_fn = SIG_DFL;
  * length to call the signal handler.
  */
 
-static unsigned __stdcall ticktack(void *dummy)
+static unsigned __stdcall ticktack(void *dummy UNUSED)
 {
 	while (WaitForSingleObject(timer_event, timer_interval) == WAIT_TIMEOUT) {
 		mingw_raise(SIGALRM);
@@ -2843,7 +3164,7 @@ static inline int is_timeval_eq(const struct timeval *i1, const struct timeval *
 	return i1->tv_sec == i2->tv_sec && i1->tv_usec == i2->tv_usec;
 }
 
-int setitimer(int type, struct itimerval *in, struct itimerval *out)
+int setitimer(int type UNUSED, struct itimerval *in, struct itimerval *out)
 {
 	static const struct timeval zero;
 	static int atexit_done;
@@ -3511,6 +3832,30 @@ static PSID get_current_user_sid(void)
 	return result;
 }
 
+static BOOL user_sid_to_user_name(PSID sid, LPSTR *str)
+{
+	SID_NAME_USE pe_use;
+	DWORD len_user = 0, len_domain = 0;
+	BOOL translate_sid_to_user;
+
+	/*
+	 * returns only FALSE, because the string pointers are NULL
+	 */
+	LookupAccountSidA(NULL, sid, NULL, &len_user, NULL, &len_domain,
+			  &pe_use);
+	/*
+	 * Alloc needed space of the strings
+	 */
+	ALLOC_ARRAY((*str), (size_t)len_domain + (size_t)len_user);
+	translate_sid_to_user = LookupAccountSidA(NULL, sid,
+	    (*str) + len_domain, &len_user, *str, &len_domain, &pe_use);
+	if (!translate_sid_to_user)
+		FREE_AND_NULL(*str);
+	else
+		(*str)[len_domain] = '/';
+	return translate_sid_to_user;
+}
+
 static int acls_supported(const char *path)
 {
 	size_t offset = offset_1st_component(path);
@@ -3587,30 +3932,50 @@ int is_path_owned_by_current_sid(const char *path, struct strbuf *report)
 			/*
 			 * On FAT32 volumes, ownership is not actually recorded.
 			 */
-			strbuf_addf(report, "'%s' is on a file system that does"
+			strbuf_addf(report, "'%s' is on a file system that does "
 				    "not record ownership\n", path);
 		} else if (report) {
-			LPSTR str1, str2, to_free1 = NULL, to_free2 = NULL;
+			PCSTR str1, str2, str3, str4;
+			LPSTR to_free1 = NULL, to_free3 = NULL,
+			    to_local_free2 = NULL, to_local_free4 = NULL;
 
-			if (ConvertSidToStringSidA(sid, &str1))
-				to_free1 = str1;
+			if (user_sid_to_user_name(sid, &to_free1))
+				str1 = to_free1;
 			else
 				str1 = "(inconvertible)";
-
-			if (!current_user_sid)
-				str2 = "(none)";
-			else if (!IsValidSid(current_user_sid))
-				str2 = "(invalid)";
-			else if (ConvertSidToStringSidA(current_user_sid, &str2))
-				to_free2 = str2;
+			if (ConvertSidToStringSidA(sid, &to_local_free2))
+				str2 = to_local_free2;
 			else
 				str2 = "(inconvertible)";
+
+			if (!current_user_sid) {
+				str3 = "(none)";
+				str4 = "(none)";
+			}
+			else if (!IsValidSid(current_user_sid)) {
+				str3 = "(invalid)";
+				str4 = "(invalid)";
+			} else {
+				if (user_sid_to_user_name(current_user_sid,
+							  &to_free3))
+					str3 = to_free3;
+				else
+					str3 = "(inconvertible)";
+				if (ConvertSidToStringSidA(current_user_sid,
+							   &to_local_free4))
+					str4 = to_local_free4;
+				else
+					str4 = "(inconvertible)";
+			}
 			strbuf_addf(report,
 				    "'%s' is owned by:\n"
-				    "\t'%s'\nbut the current user is:\n"
-				    "\t'%s'\n", path, str1, str2);
-			LocalFree(to_free1);
-			LocalFree(to_free2);
+				    "\t%s (%s)\nbut the current user is:\n"
+				    "\t%s (%s)\n",
+				    path, str1, str2, str3, str4);
+			free(to_free1);
+			LocalFree(to_local_free2);
+			free(to_free3);
+			LocalFree(to_local_free4);
 		}
 	}
 
@@ -3784,7 +4149,12 @@ int handle_long_path(wchar_t *path, int len, int max_path, int expand)
 	 * "cwd + path" doesn't due to '..' components)
 	 */
 	if (result < max_path) {
-		wcscpy(path, buf);
+		/* Be careful not to add a drive prefix if there was none */
+		if (is_wdir_sep(path[0]) &&
+		    !is_wdir_sep(buf[0]) && buf[1] == L':' && is_wdir_sep(buf[2]))
+			wcscpy(path, buf + 2);
+		else
+			wcscpy(path, buf);
 		return result;
 	}
 
@@ -3936,7 +4306,8 @@ static BOOL WINAPI handle_ctrl_c(DWORD ctrl_type)
  */
 int wmain(int argc, const wchar_t **wargv)
 {
-	int i, maxlen, exit_status;
+	int i, exit_status;
+	size_t maxlen;
 	char *buffer, **save;
 	const char **argv;
 
@@ -4026,6 +4397,27 @@ int uname(struct utsname *buf)
 		  "%u", (v >> 16) & 0x7fff);
 	return 0;
 }
+
+#ifndef NO_UNIX_SOCKETS
+int mingw_have_unix_sockets(void)
+{
+	SC_HANDLE scm, srvc;
+	SERVICE_STATUS_PROCESS status;
+	DWORD bytes;
+	int ret = 0;
+	scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+	if (scm) {
+		srvc = OpenServiceA(scm, "afunix", SERVICE_QUERY_STATUS);
+		if (srvc) {
+			if(QueryServiceStatusEx(srvc, SC_STATUS_PROCESS_INFO, (LPBYTE)&status, sizeof(SERVICE_STATUS_PROCESS), &bytes))
+				ret = status.dwCurrentState == SERVICE_RUNNING;
+			CloseServiceHandle(srvc);
+		}
+		CloseServiceHandle(scm);
+	}
+	return ret;
+}
+#endif
 
 /*
  * Based on https://stackoverflow.com/questions/43002803

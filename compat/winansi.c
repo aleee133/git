@@ -4,6 +4,8 @@
 
 #undef NOGDI
 
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "../git-compat-util.h"
 #include <wingdi.h>
 #include <winreg.h>
@@ -139,7 +141,7 @@ static void write_console(unsigned char *str, size_t len)
 	/* convert utf-8 to utf-16 */
 	int wlen = xutftowcsn(wbuf, (char*) str, ARRAY_SIZE(wbuf), len);
 	if (wlen < 0) {
-		wchar_t *err = L"[invalid]";
+		const wchar_t *err = L"[invalid]";
 		WriteConsoleW(console, err, wcslen(err), &dummy, NULL);
 		return;
 	}
@@ -340,7 +342,7 @@ enum {
 	TEXT = 0, ESCAPE = 033, BRACKET = '['
 };
 
-static DWORD WINAPI console_thread(LPVOID unused)
+static DWORD WINAPI console_thread(LPVOID data UNUSED)
 {
 	unsigned char buffer[BUFFER_SIZE];
 	DWORD bytes;
@@ -594,6 +596,49 @@ static void detect_msys_tty(int fd)
 
 #endif
 
+static HANDLE std_console_handle;
+static DWORD std_console_mode = ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+static UINT std_console_code_page = CP_UTF8;
+
+static void reset_std_console(void)
+{
+	if (std_console_mode != ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+		SetConsoleMode(std_console_handle, std_console_mode);
+	if (std_console_code_page != CP_UTF8)
+		SetConsoleOutputCP(std_console_code_page);
+}
+
+static int enable_virtual_processing(void)
+{
+	std_console_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (std_console_handle == INVALID_HANDLE_VALUE ||
+	    !GetConsoleMode(std_console_handle, &std_console_mode)) {
+		std_console_handle = GetStdHandle(STD_ERROR_HANDLE);
+		if (std_console_handle == INVALID_HANDLE_VALUE ||
+		    !GetConsoleMode(std_console_handle, &std_console_mode))
+		return 0;
+	}
+
+	std_console_code_page = GetConsoleOutputCP();
+	if (std_console_code_page != CP_UTF8)
+		SetConsoleOutputCP(CP_UTF8);
+	if (!std_console_code_page)
+		std_console_code_page = CP_UTF8;
+
+	atexit(reset_std_console);
+
+	if (std_console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+		return 1;
+
+	if (!SetConsoleMode(std_console_handle,
+			    std_console_mode |
+			    ENABLE_PROCESSED_OUTPUT |
+			    ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+		return 0;
+
+	return 1;
+}
+
 /*
  * Wrapper for isatty().  Most calls in the main git code
  * call isatty(1 or 2) to see if the instance is interactive
@@ -632,6 +677,9 @@ void winansi_init(void)
 		return;
 	}
 
+	if (enable_virtual_processing())
+		return;
+
 	/* create a named pipe to communicate with the console thread */
 	if (swprintf(name, ARRAY_SIZE(name) - 1, L"\\\\.\\pipe\\winansi%lu",
 		     GetCurrentProcessId()) < 0)
@@ -647,7 +695,7 @@ void winansi_init(void)
 
 	/* start console spool thread on the pipe's read end */
 	hthread = CreateThread(NULL, 0, console_thread, NULL, 0, NULL);
-	if (hthread == INVALID_HANDLE_VALUE)
+	if (!hthread)
 		die_lasterr("CreateThread(console_thread) failed");
 
 	/* schedule cleanup routine */

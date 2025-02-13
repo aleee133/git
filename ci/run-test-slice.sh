@@ -10,6 +10,11 @@ group "Run tests" make --quiet -C t T="$(cd t &&
 	tr '\n' ' ')" ||
 handle_failed_tests
 
+# We only have one unit test at the moment, so run it in the first slice
+if [ "$1" == "0" ] ; then
+	group "Run unit tests" make --quiet -C t unit-tests-test-tool
+fi
+
 # Run the git subtree tests only if main tests succeeded
 test 0 != "$1" || make -C contrib/subtree test
 
